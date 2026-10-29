@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 04 课 · Transport 抽象层</title>
+  <link rel="stylesheet" href="../assets/styles.css">
+</head>
+<body>
+<div class="container">
+
+  <div class="breadcrumb">
+    <a href="../MISSION.md">Mission</a> → Kestrel 源码学习 → 第 04 课
+  </div>
+
+  <h1>第 04 课 · Transport 抽象层 —— Socket 可以被替换吗？</h1>
+
+  <div class="meta">
+    <span>预计阅读 12 分钟</span>
+    <span>依赖倒置</span>
+    <span>四层架构的物理边界</span>
+  </div>
+
+  <!-- 问题引入 -->
+  <h2>现在我们的代码有什么耦合？</h2>
+
+  <p>打开你的 <code>HttpConnection.cs</code>，第一行 <code>using System.Net.Sockets;</code>，然后整个类里到处是 <code>_socket.ReceiveAsync()</code>、<code>_socket.SendAsync()</code>、<code>_socket.Shutdown()</code>、<code>_socket.RemoteEndPoint</code>。</p>
+
+  <p><strong>HttpConnection 就是 Socket 的薄壳 —— 换传输 = 重写整个 Connection</strong>。这违反了 Kestrel 四层架构的核心原则：</p>
+
+<pre><code>① KestrelServer         — 监听循环
+② Transport 层           — "我给你一条双向字节通道"  ← 这层应该可替换
+③ Protocol Layer         — HttpConnection ← 不应该知道底下是 Socket
+④ Application Pipeline  — 中间件管道</code></pre>
+
+  <blockquote>
+    <strong>依赖倒置原则在这里的具体应用：</strong>Connection 应该依赖一个"字节通道"的抽象，而不是 Socket 本身。Socket 是 Transport 层的实现细节，Connection 层不应该感知它。这样换 QUIC、换 Pipe、换 WebTransport，Connection 层一行不动。
+  </blockquote>
+
+  <!-- 接口应该长什么样 -->
+  <h2>Transport 接口应该长什么样？</h2>
+
+  <p>在动手写接口之前，先想清楚：<strong>Connection 到底需要 Transport 提供什么？</strong></p>
+
+  <p>回看我们的 <code>HttpConnection</code>，它对 Socket 只做了这几件事：</p>
+
+  <ol>
+    <li><strong>读字节</strong> — <code>await _socket.ReceiveAsync(buffer, ct)</code></li>
+    <li><strong>写字节</strong> — <code>await _socket.SendAsync(bytes, ct)</code></li>
+    <li><strong>查对端地址</strong> — <code>_socket.RemoteEndPoint?.ToString()</code></li>
+    <li><strong>关连接</strong> — <code>_socket.Shutdown()</code> + <code>_socket.Close()</code></li>
+    <li><strong>禁 Nagle</strong> — <code>_socket.NoDelay = true</code>（Socket 特有优化）</li>
+  </ol>
+
+  <p>抽成接口：</p>
+
+<pre><code>// 我们的简化版 Transport 接口
+// Kestrel 里对应的是 abstract class TransportConnection
+
+public interface ITransportConnection : IAsyncDisposable
+{
+    // 核心：双向字节流
+    Task&lt;int&gt; ReadAsync(Memory&lt;byte&gt; buffer, CancellationToken ct = default);
+    Task WriteAsync(ReadOnlyMemory&lt;byte&gt; buffer, CancellationToken ct = default);
+
+    // 连接信息
+    string? RemoteAddress { get; }
+    string? LocalAddress { get; }
+
+    // 控制
+    CancellationToken Closed { get; }
+}</code></pre>
+
+  <p>注意几个设计决策：</p>
+
+  <ul>
+    <li>✅ 用 <code>Memory&lt;byte&gt;</code> 代替 <code>byte[] + offset + count</code> — .NET 现代写法，Span/Memory 支持连续的任意类型内存，性能更好</li>
+    <li>✅ <code>ReadAsync</code> 返回 <code>Task&lt;int&gt;</code> — 和 Socket.ReceiveAsync 语义对齐，0 = 对端关闭</li>
+    <li>✅ <code>Closed</code> 令牌 — 连接层可以等待传输层主动关闭，不需要轮询</li>
+    <li>❌ 没有 NoDelay — 这是 Socket 专属优化，不属于"字节通道"的契约。SocketTransport 实现里自己设</li>
+  </ul>
+
+  <!-- SocketTransport 实现 -->
+  <h2>SocketTransport —— 第一个实现</h2>
+
+  <p>把 Socket 包装成接口实现就叫 SocketTransport：</p>
+
+<pre><code>// Transport 层的默认实现：基于 Socket
+public class SocketTransport : ITransportConnection
+{
+    private readonly Socket _socket;
+    private readonly CancellationTokenSource _closedCts;
+
+    public string? RemoteAddress { get; }
+    public string? LocalAddress { get; }
+    public CancellationToken Closed =&gt; _closedCts.Token;
+
+    public SocketTransport(Socket socket)
+    {
+        _socket = socket;
+        _socket.NoDelay = true; // Socket 专属优化，放在 Transport 实现里
+
+        RemoteAddress = socket.RemoteEndPoint?.ToString();
+        LocalAddress = socket.LocalEndPoint?.ToString();
+
+        _closedCts = new CancellationTokenSource();
+    }
+
+    public async Task&lt;int&gt; ReadAsync(Memory&lt;byte&gt; buffer, CancellationToken ct = default)
+    {
+        try
+        {
+            var n = await _socket.ReceiveAsync(buffer, ct);
+            if (n == 0) _closedCts.Cancel(); // 对端关闭
+            return n;
+        }
+        catch when (!ct.IsCancellationRequested)
+        {
+            _closedCts.Cancel();
+            throw;
+        }
+    }
+
+    public async Task WriteAsync(ReadOnlyMemory&lt;byte&gt; buffer, CancellationToken ct = default)
+    {
+        await _socket.SendAsync(buffer, ct);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        try { _socket.Shutdown(SocketShutdown.Both); } catch { }
+        try { _socket.Close(); } catch { }
+        _closedCts.Dispose();
+        await Task.CompletedTask;
+    }
+}</code></pre>
+
+  <!-- Kestrel 用了 Pipe 不是 Stream -->
+  <h2>重要：Kestrel 用 Pipe，不是 Stream</h2>
+
+  <p>我们这个接口看起来就是个 Stream 对吧？Kestrel 当年也用 Stream，但 2.1 之后换成了 <strong>System.IO.Pipelines</strong>。区别在于：</p>
+
+  <table>
+    <tr><th>维度</th><th>Stream</th><th>Pipe</th></tr>
+    <tr><td>内存管理</td><td>每次 Read 调用者提供 buffer（可能 new byte[]）</td><td>Pipe 自己管理内存池（MemoryPool&lt;T&gt;），避免分配</td></tr>
+    <tr><td>消费模型</td><td>Read → 拷贝到你 buffer → 消费</td><td>Reader 直接拿到 PipeWriter 写入的内存引用，零拷贝</td></tr>
+    <tr><td>背压</td><td>靠 Socket 自己</td><td>Pipe 内置 CanWrite / FlushAsync 背压机制</td></tr>
+    <tr><td>适用场景</td><td>简单异步 I/O</td><td>高性能、高并发、需要零拷贝</td></tr>
+  </table>
+
+  <blockquote>
+    <strong>Kestrel 的 TransportConnection</strong> 抽象类暴露两个 Pipe：<code>Input</code>（PipeReader）和 <code>Output</code>（PipeWriter）。Http1Connection 读请求就是从 Input.ReadAsync() 拿内存，直接解析；写响应就是往 Output.WriteAsync() 写内存。全程零分配，这是 Kestrel 能跑到每秒几十万请求的关键之一。
+  </blockquote>
+
+  <div class="tip">
+    <strong>我们这节课先不用 Pipe。</strong>先把接口抽象层建好，理解依赖倒置的结构。下一阶段可以引入 Pipe 替换 Stream，体验真正的零拷贝。Pipe 是 .NET 高吞吐 I/O 的重头戏，值得单独一课。
+  </div>
+
+  <!-- ConnectionFactory 也跟着变 -->
+  <h2>ConnectionFactory 也跟着拆</h2>
+
+  <p>现在 Program.cs 里的 Accept 循环：</p>
+
+<pre><code>// v0.3 版本 — Program.cs 知道 Socket
+while (true) {
+    var socket = await listener.AcceptAsync();     // ← 直接拿到 Socket
+    var conn = new HttpConnection(socket);          // ← 直接传给 Connection
+    _ = RunConnectionAsync(conn);
+}</code></pre>
+
+  <p>拆 Transport 之后，Accept 循环变成：</p>
+
+<pre><code>// v0.4 版本 — Transport 层包装 Socket，ConnectionFactory 负责创建 Connection
+while (true) {
+    var socket = await listener.AcceptAsync();
+    var transport = new SocketTransport(socket);   // ← Transport 层包装
+    var conn = new HttpConnection(transport);       // ← Connection 只依赖接口
+    _ = RunConnectionAsync(conn);
+}</code></pre>
+
+  <p>此时 Program.cs 扮演了 Kestrel 的 <strong>KestrelServerImpl + ConnectionFactory</strong> 组合角色。未来多 Transport 场景下，会有一个 TransportManager 管理多个监听（HTTP + HTTPS + QUIC），每个 Accept 出的连接先过对应的 Transport 包装，再统一丢给 ConnectionFactory。</p>
+
+  <!-- 动手任务 -->
+  <h2>🎯 动手改造清单</h2>
+
+  <ol>
+    <li>新建 <code>ITransportConnection.cs</code> — 接口定义</li>
+    <li>新建 <code>SocketTransport.cs</code> — 接口的 Socket 实现</li>
+    <li>重构 <code>HttpConnection.cs</code>：构造函数从接收 Socket 改为接收 ITransportConnection，内部所有 <code>_socket.</code> 改为 <code>_transport.</code></li>
+    <li>改 <code>Program.cs</code>：Accept 后先 new SocketTransport 再传给 HttpConnection</li>
+    <li>新增一个 <strong>LoopbackTransport</strong>（可选挑战）— 用两个 MemoryStream 作为读写通道，让你不依赖真实 Socket 也能测试 Connection 逻辑</li>
+  </ol>
+
+  <h3>重构的自检清单</h3>
+
+  <ul>
+    <li>✅ HttpConnection.cs 里不再出现 <code>using System.Net.Sockets</code></li>
+    <li>✅ HttpConnection.cs 里不再出现 <code>Socket</code> 类型</li>
+    <li>✅ HttpConnection 构造函数参数是 <code>ITransportConnection</code></li>
+    <li>✅ Program.cs 是唯一知道 Socket 类型的文件（除了 SocketTransport 自己）</li>
+  </ul>
+
+  <!-- Kestrel 源码锚点 -->
+  <h2>Kestrel 源码里的对应</h2>
+
+  <ul>
+    <li>👉 <code>TransportConnection.cs</code>（抽象类）— Kestrel 版本的 ITransportConnection，比我们的复杂很多：有 Input Pipe、Output Pipe、ConnectionClosed 令牌、RemoteAddress、LocalAddress、TransportFeatures 字典</li>
+    <li>👉 <code>SocketsTransportConnection.cs</code> — Socket 实现。它在后台跑两个循环：一个从 Socket 读 → 写入 Input Pipe，一个从 Output Pipe 读 → 写到 Socket</li>
+    <li>👉 <code>QuicTransportConnection.cs</code> — QUIC 实现。QUIC 有多个 Stream，所以这个 Transport 会为每个 Stream 创建子 ConnectionContext</li>
+    <li>👉 观察两个 Transport 实现的共同模式：<strong>Transport 层负责字节搬运，Protocol 层负责字节解析，两层之间用 Pipe 解耦</strong></li>
+  </ul>
+
+  <!-- 下一课预告 -->
+  <div class="lesson-nav">
+    <a href="0003-keep-alive.html">← 第 03 课：Keep-Alive</a>
+    <span style="color:var(--text-muted); font-size:0.9rem; align-self:center;">
+      重构完，验证一切工作正常。<br>再看看 HttpConnection.cs 里还有没有 Socket 的痕迹 —— 应该干净了。
+    </span>
+    <span class="disabled">第 05 课：Features 字典 →</span>
+  </div>
+
+</div>
+</body>
+</html>

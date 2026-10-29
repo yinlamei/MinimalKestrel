@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 08 课 · HTTP/2 与 HTTP/3 — 二进制帧、QUIC 和 Kestrel 源码</title>
+  <link rel="stylesheet" href="../assets/styles.css">
+</head>
+<body>
+<div class="container">
+
+  <div class="breadcrumb">
+    <a href="../MISSION.md">Mission</a> → Kestrel 源码学习 → 第 08 课
+  </div>
+
+  <h1>第 08 课 · HTTP/2 与 HTTP/3 —— 二进制帧、QUIC 和 Kestrel 源码</h1>
+
+  <div class="meta">
+    <span>预计阅读 30 分钟</span>
+    <span>RFC 7540 / 9114 / 9000</span>
+    <span>我们的代码：Http2Parser + H2Connection + Http3Parser + H3Connection</span>
+  </div>
+
+  <!-- ======= 为什么需要 HTTP/2 和 HTTP/3 ======= -->
+  <h2>为什么 HTTP/1.1 不够用？</h2>
+
+  <p>到第 07 课为止，我们一直在和 HTTP/1.1 打交道 —— 文本协议、请求-响应模式、Keep-Alive 一条 TCP 连接串行处理多个请求。问题很明显：</p>
+
+  <ol>
+    <li><strong>队头阻塞 (Head-of-Line Blocking)</strong> — 一个 TCP 连接上，第一个请求没响应完，后面的请求必须等。浏览器最多对同一域名开 6 个 TCP 连接。</li>
+    <li><strong>头部冗余</strong> — 每个请求都要重复发送 User-Agent、Cookie 等相同头部，纯文本没压缩。</li>
+    <li><strong>TCP 握手慢</strong> — 每次新建 TCP 连接要 3 次握手 + TLS 3 次握手，冷启动开销大。</li>
+    <li><strong>传输层队头阻塞</strong> — TCP 丢一个包，整个连接上所有后续数据都要等重传。</li>
+  </ol>
+
+  <p><strong>HTTP/2</strong> 解决了前三个问题（应用层优化），<strong>HTTP/3</strong> 用 QUIC 解决了第四个问题（传输层也不阻塞了）。</p>
+
+  <!-- ======= 协议演进图 ======= -->
+  <h2>三代 HTTP 协议对比</h2>
+
+  <table>
+    <tr>
+      <th>维度</th><th>HTTP/1.1</th><th>HTTP/2</th><th>HTTP/3</th>
+    </tr>
+    <tr>
+      <td><strong>传输层</strong></td>
+      <td>TCP</td>
+      <td>TCP</td>
+      <td><strong>QUIC (UDP)</strong></td>
+    </tr>
+    <tr>
+      <td><strong>协议格式</strong></td>
+      <td>纯文本（ASCII）</td>
+      <td>二进制帧（9 字节头 + 载荷）</td>
+      <td>二进制帧（varint 头 + 载荷）</td>
+    </tr>
+    <tr>
+      <td><strong>并发模型</strong></td>
+      <td>串行（同一 TCP 一次一个请求）</td>
+      <td>多路复用（同 TCP 上 N 个并发 Stream）</td>
+      <td>多路复用（同 QUIC 连接上 N 个 Stream）</td>
+    </tr>
+    <tr>
+      <td><strong>头部编码</strong></td>
+      <td>纯文本，无压缩</td>
+      <td>HPACK（静态表 + 动态表 + Huffman）</td>
+      <td>QPACK（比 HPACK 多了动态表同步流）</td>
+    </tr>
+    <tr>
+      <td><strong>队头阻塞</strong></td>
+      <td>应用层 ✗ + 传输层 ✗</td>
+      <td>应用层 ✓ + 传输层 ✗</td>
+      <td>应用层 ✓ + 传输层 ✓</td>
+    </tr>
+    <tr>
+      <td><strong>握手开销</strong></td>
+      <td>TCP + TLS 各一次</td>
+      <td>TCP + TLS 一次，连接复用</td>
+      <td>QUIC 把 TLS 1.3 合并到握手，0-RTT 恢复</td>
+    </tr>
+    <tr>
+      <td><strong>Kestrel 源码</strong></td>
+      <td><code>Http1Connection.cs</code></td>
+      <td><code>Http2Connection.cs</code> (~2000 行)</td>
+      <td><code>Http3Connection.cs</code> (~800 行)</td>
+    </tr>
+  </table>
+
+  <!-- ======= HTTP/2 核心概念 ======= -->
+  <h2>HTTP/2 核心概念</h2>
+
+  <p>RFC 7540 定义了 HTTP/2。它的所有改进都基于一个核心思想 —— <strong>在一条 TCP 连接上多路复用多个并发的"流" (Stream)</strong>。</p>
+
+  <h3>① Stream（流）</h3>
+  <p>Stream 是 HTTP/2 的基本单位 —— 一个请求-响应对就是一个 Stream。每个 Stream 有唯一 ID（客户端发起的是奇数：1, 3, 5...；服务端发起的是偶数：2, 4, 6...）。</p>
+  <p>同一条 TCP 连接上可以同时存在上百个 Stream，互不干扰。每个 Stream 有自己的流量窗口和错误状态。</p>
+
+  <h3>② Frame（帧）</h3>
+  <p>所有数据（请求头部、请求体、响应头部、响应体、控制命令……）都被切成一个个小帧发送。这就是"二进制分帧层"。</p>
+
+  <div class="diagram">
+<pre>
++-----------------------------------------------+
+|                 Length (24)                   |  ← 3 字节：载荷长度
++---------------+---------------+---------------+
+|   Type (8)    |   Flags (8)                   |  ← 2 字节：帧类型 + 标志
++-+-------------+---------------+-------------------+
+|R|                 Stream Identifier (31)         |  ← 4 字节：Stream ID（最高位 R 保留）
++-+-------------------------------------------------+
+|                    Payload ...                     |  ← 0 ~ 16384 字节
++---------------------------------------------------+
+         HTTP/2 帧头 = 固定 9 字节 + 载荷
+
+         ↓ 对照我们的 Http2Parser.TryParseFrameHeader ↓
+</pre>
+  </div>
+
+  <h3>③ Connection Preface（连接前言）</h3>
+  <p>HTTP/2 有个"入门仪式" —— 客户端必须先发 24 字节的魔数，告诉服务器"我要升级到 HTTP/2"：</p>
+  <pre><code>PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n</code></pre>
+  <p>这就是我们在 <code>H2Connection.StartAsync()</code> 里首先检查的东西。如果不是这 24 字节，那就是 HTTP/1.1。</p>
+
+  <!-- ======= HTTP/2 帧类型 ======= -->
+  <h3>④ 10 种帧类型</h3>
+
+  <table>
+    <tr><th>Type 值</th><th>名称</th><th>作用</th><th>常带的 Flags</th></tr>
+    <tr><td>0x0</td><td>DATA</td><td>请求体 / 响应体数据</td><td>END_STREAM (0x01)</td></tr>
+    <tr><td>0x1</td><td>HEADERS</td><td>请求头 / 响应头（含伪头部 :method、:path 等）</td><td>END_HEADERS (0x04)、END_STREAM</td></tr>
+    <tr><td>0x3</td><td>RST_STREAM</td><td>强制关闭某个 Stream（带错误码）</td><td>—</td></tr>
+    <tr><td>0x4</td><td>SETTINGS</td><td>参数协商（窗口大小、最大并发流数等）</td><td>ACK (0x01)</td></tr>
+    <tr><td>0x6</td><td>PING</td><td>心跳检测</td><td>ACK (0x01)</td></tr>
+    <tr><td>0x7</td><td>GOAWAY</td><td>关闭整个连接（带最后处理的 Stream ID）</td><td>—</td></tr>
+    <tr><td>0x8</td><td>WINDOW_UPDATE</td><td>流量控制 — 告诉对方我还能接收多少字节</td><td>—</td></tr>
+  </table>
+
+  <h3>⑤ HPACK — 头部压缩</h3>
+  <p>HTTP/2 用 HPACK 协议压缩头部。完整 HPACK 包含：</p>
+  <ul>
+    <li><strong>静态表</strong> — 61 个常见头部预定义（:method=GET、:scheme=https、content-type 等）</li>
+    <li><strong>动态表</strong> — 连接过程中出现的新头部按序加入，双方同步维护</li>
+    <li><strong>Huffman 编码</strong> — 对字符串值做 Huffman 压缩</li>
+  </ul>
+  <p>Kestrel 的 HPACK 实现在 <code>src/Servers/Kestrel/Http/Shared/HPackDecoder.cs</code> (~500 行) 和 <code>HPackEncoder.cs</code> (~300 行)。</p>
+  <p><strong>我们的简化版</strong> — 只用了 Literal Header Field Without Indexing（前缀 0x00 + 字符串长度 + ASCII 内容），不走 Huffman、不走静态表索引。能跑通但不压缩。</p>
+
+  <!-- ======= HTTP/2 代码 Walkthrough ======= -->
+  <h2>HTTP/2 代码 Walkthrough — 我们的 H2Connection</h2>
+
+  <p>我们的 HTTP/2 实现分布在这几个文件里：</p>
+  <ul>
+    <li><code>Http2Frames.cs</code> — 帧类型枚举、常量、record 定义</li>
+    <li><code>Http2Parser.cs</code> — 帧头编解码 + 简化版 HPACK</li>
+    <li><code>Http2Stream.cs</code> — Stream POCO（请求 + 响应状态）</li>
+    <li><code>H2Connection.cs</code> — 完整 HTTP/2 连接处理</li>
+  </ul>
+
+  <h3>Step 1: 连接前言校验</h3>
+<pre><code>// H2Connection.StartAsync() 的第一件事
+var preface = Http2Constants.ConnectionPreface;  // 24 字节
+while (_rxLen < preface.Length)
+{
+    var n = await _transport.ReadAsync(_rxBuf.AsMemory()[_rxLen..], ct);
+    _rxLen += n;
+}
+if (!_rxBuf.AsSpan(0, 24).SequenceEqual(preface))
+{
+    // 不是 HTTP/2，放弃
+    return;
+}
+</code></pre>
+
+  <h3>Step 2: 发 SETTINGS 帧</h3>
+<pre><code>// 告诉客户端我们支持什么参数
+var mySettings = new List&lt;Http2Setting&gt;
+{
+    new(Http2SettingId.MAX_CONCURRENT_STREAMS, 100),
+    new(Http2SettingId.INITIAL_WINDOW_SIZE, 65535),
+};
+var frame = Http2Parser.BuildSettingsFrame(mySettings);
+await _transport.WriteAsync(frame, ct);
+</code></pre>
+
+  <h3>Step 3: 帧主循环</h3>
+  <p>连接建立后进入主循环 —— 不断从 TCP 读数据，完整解析出一个个帧，分发到对应的 handler：</p>
+
+<pre><code>while (true)
+{
+    // 循环：缓冲区里能解析多少帧就解析多少
+    while (_rxPos < _rxLen)
+    {
+        // 先等够 9 字节帧头
+        if (_rxLen - _rxPos < 9) break;
+
+        // 解码帧头
+        TryParseFrameHeader(_rxBuf.AsSpan(_rxPos), out length, out type, out flags, out streamId);
+
+        // 等够载荷
+        if (_rxLen - _rxPos < 9 + length) break;
+
+        // 拷贝 payload，构造 Http2Frame
+        var frame = new Http2Frame(length, type, flags, streamId, payload);
+        _rxPos += 9 + length;
+
+        // 分发处理
+        await HandleFrameAsync(frame, ct);
+    }
+
+    // 缓冲区不够 → 挪数据 + 继续从 TCP 读
+    _transport.ReadAsync(...);
+}
+</code></pre>
+
+  <h3>Step 4: HEADERS 帧 → 创建 Stream → 调 Pipeline</h3>
+  <p>HEADERS 帧到来时，我们创建或获取对应的 Http2Stream，把 HPACK 解码后的头部（注意 HTTP/2 头部里有 <code>:method</code>、<code>:path</code>、<code>:scheme</code>、<code>:authority</code> 四个"伪头部"）填进去，然后启动 Pipeline：</p>
+
+<pre><code>case Http2FrameType.HEADERS:
+    // 解码 HPACK
+    var headers = Http2Parser.DecodeHeadersFrame(frame.Payload);
+
+    // 创建/获取 Stream
+    if (!_streams.TryGetValue(frame.StreamId, out var stream))
+    {
+        stream = new Http2Stream(frame.StreamId);
+        _streams[frame.StreamId] = stream;
+    }
+
+    // 伪头部 → Method / Path
+    foreach (var h in headers)
+    {
+        switch (h.Key)
+        {
+            case ":method":    stream.Method = h.Value; break;
+            case ":path":      stream.Path   = h.Value; break;
+            case ":scheme":    stream.Scheme = h.Value; break;
+            case ":authority": stream.Authority = h.Value; break;
+        }
+    }
+
+    // 头部完整了 → 异步启动 Pipeline
+    if (endHeaders)
+        _ = RunStreamPipelineAsync(frame.StreamId, ct);
+</code></pre>
+
+  <h3>Step 5: Pipeline 执行 + 发送响应帧</h3>
+  <p>Pipeline 和 HTTP/1.1 完全一样 —— FeatureCollection 模式。区别只是发回响应时要包成 HTTP/2 HEADERS 帧（加 <code>:status</code> 伪头部）+ DATA 帧（响应体分块，每块 ≤ 16KB）。</p>
+
+  <!-- ======= Kestrel HTTP/2 源码地图 ======= -->
+  <h2>Kestrel 的 HTTP/2 源码地图</h2>
+
+  <p>Kestrel 的 HTTP/2 实现位于 <code>src/Servers/Kestrel/Http/</code> 目录，核心文件：</p>
+
+  <table>
+    <tr><th>文件</th><th>行数</th><th>职责</th></tr>
+    <tr><td><code>Http2Connection.cs</code></td><td>~2000</td><td>HTTP/2 连接总控 — SETTINGS 协商、帧循环、Stream 管理、Flow Control</td></tr>
+    <tr><td><code>Http2Stream.cs</code></td><td>~400</td><td>单个 Stream 状态机 — 头部/Body 到达事件、窗口更新、终止</td></tr>
+    <tr><td><code>Shared/Http2FrameReader.cs</code></td><td>~600</td><td>从 Pipe 读取字节 → 解析出 Http2Frame（包含 SETTINGS、HEADERS、DATA 等）</td></tr>
+    <tr><td><code>Shared/Http2FrameWriter.cs</code></td><td>~800</td><td>把 Http2Frame 写回 Pipe（包含流量窗口管理、流控）</td></tr>
+    <tr><td><code>Shared/HPackDecoder.cs</code></td><td>~500</td><td>HPACK 解码（静态表 + 动态表 + Huffman 解码）</td></tr>
+    <tr><td><code>Shared/HPackEncoder.cs</code></td><td>~300</td><td>HPACK 编码（选最短的编码方式）</td></tr>
+    <tr><td><code>Shared/Http2DynamicTable.cs</code></td><td>~200</td><td>HPACK 动态表实现（LRU 淘汰）</td></tr>
+    <tr><td><code>FlowControl/Http2StreamFlowControl.cs</code></td><td>~300</td><td>单 Stream 流量窗口（保证不发送超窗数据）</td></tr>
+    <tr><td><code>FlowControl/Http2ConnectionFlowControl.cs</code></td><td>~200</td><td>连接级流量窗口（所有 Stream 共享）</td></tr>
+  </table>
+
+  <p>对比我们的简化版，Kestrel 多出来的核心模块：</p>
+  <ul>
+    <li>✅ <strong>流量控制</strong>（Flow Control）— 每个 Stream 和整个连接都有发送窗口，防止慢客户端拖垮服务器</li>
+    <li>✅ <strong>完整 HPACK</strong>（Huffman + 动态表）— 头部可能压缩到原来的 1/5</li>
+    <li>✅ <strong>PIPE 架构</strong> — Http2FrameReader 从 PipeReader 读，Http2FrameWriter 往 PipeWriter 写，Connection 层只管帧分发</li>
+    <li>✅ <strong>Continuation 帧处理</strong> — HEADERS 超过 16KB 会拆成多帧，最后一帧才带 END_HEADERS</li>
+    <li>✅ <strong>SETTINGS 超时机制</strong> — 如果对端不回 SETTINGS ACK，主动关闭连接</li>
+  </ul>
+
+  <!-- ======= HTTP/3 ======= -->
+  <h2>HTTP/3 —— 跑在 QUIC 上</h2>
+
+  <p>HTTP/3 最大的变化不是协议格式，而是<strong>底层传输从 TCP 换成了 QUIC</strong>。QUIC 是 Google 为 HTTP/3 设计的传输层（RFC 9000），跑在 UDP 上。</p>
+
+  <h3>QUIC 解决了什么？</h3>
+  <ul>
+    <li><strong>传输层不丢包阻塞</strong> — 每个 QUIC Stream 独立可靠传输，Stream A 丢包不影响 Stream B</li>
+    <li><strong>TLS 1.3 内建</strong> — QUIC 握手 + TLS 1.3 合并成 1-RTT，恢复会话甚至 0-RTT</li>
+    <li><strong>连接迁移</strong> — 客户端 IP 变了（WiFi → 4G），QUIC 用 Connection ID 识别连接，不会断开</li>
+  </ul>
+
+  <h3>HTTP/3 帧格式</h3>
+  <p>HTTP/3 的帧头比 HTTP/2 更简洁 —— 没有 Stream ID（因为 QUIC 本身就是分 Stream 的），没有固定 9 字节头。用 QUIC varint 编码变长头：</p>
+
+  <div class="diagram">
+<pre>
++---------------------------+---------------------------+
+|   Type (varint, 1-8字节)  |   Length (varint, 1-8字节)|
++---------------------------+---------------------------+
+|                     Payload ...                        |
++--------------------------------------------------------+
+        HTTP/3 帧头 = varint type + varint length + 载荷
+        ↓ 对照我们的 Http3Parser ↓
+
+QUIC Varint 编码规则（RFC 9000 Section 16）：
+  0x00-0x3F  → 1 字节  (值 0 - 63)
+  0x40-0xBF  → 2 字节  (值 64 - 16383)
+  0xC0-0xFF  → 4 字节  (值 16384 - 1073741823)
+  0xFE-0xFF  → 8 字节  (值 1073741824+)
+  高位 00/01/10/11 表示用几个字节
+</pre>
+  </div>
+
+  <h3>HTTP/3 Stream 类型</h3>
+  <p>QUIC 连接建立后，HTTP/3 规定了几种 Stream 用途：</p>
+  <ul>
+    <li><strong>请求-响应 Stream</strong>（双向）— 每个 HTTP/3 请求占一个 QUIC Stream。先发 HEADERS 帧，再可选 DATA 帧。这是我们简化版只处理的。</li>
+    <li><strong>Control Stream</strong>（双向）— 用来协商 SETTINGS、发 GOAWAY、发 MAX_PUSH_ID。连接建立后双方各开一个。</li>
+    <li><strong>QPACK Encoder Stream</strong>（单向）— 用来同步 QPACK 动态表状态（比 HPACK 复杂就复杂在这里）。</li>
+    <li><strong>QPACK Decoder Stream</strong>（单向）— 同理。</li>
+  </ul>
+
+  <h3>HTTP/3 vs HTTP/2 关键差异</h3>
+
+  <table>
+    <tr><th>差异点</th><th>HTTP/2 (TCP)</th><th>HTTP/3 (QUIC)</th></tr>
+    <tr><td>帧标识 Stream 的方式</td><td>帧头里带 Stream ID</td><td>QUIC 本身就是分 Stream 的，帧头不再带</td></tr>
+    <tr><td>头部压缩</td><td>HPACK（连接内同步动态表）</td><td>QPACK（用额外 Stream 同步动态表，因为 QUIC 可能丢包乱序）</td></tr>
+    <tr><td>流量控制</td><td>WINDOW_UPDATE 帧 + 连接/Stream 两级窗口</td><td>直接用 QUIC Stream 的流控</td></tr>
+    <tr><td>协议协商</td><td>ALPN "h2" 或 Upgrade: h2c</td><td>ALPN "h3"</td></tr>
+    <tr><td>需要 TLS 吗</td><td>通常需要（h2c 可以明文但不常见）</td><td><strong>必须</strong>（QUIC 强制 TLS 1.3）</td></tr>
+  </table>
+
+  <!-- ======= HTTP/3 代码 Walkthrough ======= -->
+  <h2>HTTP/3 代码 Walkthrough — 我们的 H3Connection</h2>
+
+  <h3>.NET 10 的 System.Net.Quic API</h3>
+  <p>HTTP/3 能在 .NET 上跑起来，全靠 <code>System.Net.Quic</code> 这个命名空间。我们反射出的关键 API：</p>
+
+  <table>
+    <tr><th>类</th><th>关键 API</th><th>说明</th></tr>
+    <tr><td><code>QuicListener</code></td><td><code>ListenAsync(opts, ct)</code></td><td>在 UDP 端口上监听 QUIC 连接</td></tr>
+    <tr><td></td><td><code>AcceptConnectionAsync(ct)</code></td><td>接受一个新的 QUIC 连接</td></tr>
+    <tr><td></td><td><code>IsSupported</code></td><td>检查当前 OS 支持不</td></tr>
+    <tr><td><code>QuicConnection</code></td><td><code>AcceptInboundStreamAsync(ct)</code></td><td>接受客户端发来的 Stream</td></tr>
+    <tr><td></td><td><code>CloseAsync(code, ct)</code></td><td>关闭整个 QUIC 连接</td></tr>
+    <tr><td><code>QuicStream</code></td><td><code>ReadAsync(mem, ct)</code></td><td>读数据（返回 ValueTask）</td></tr>
+    <tr><td></td><td><code>WriteAsync(mem, ct)</code></td><td>写数据</td></tr>
+    <tr><td></td><td><code>CompleteWrites()</code></td><td>告诉对端：我不会再发数据了（End of Stream）</td></tr>
+  </table>
+
+  <h3>Program.cs 里的 HTTP/3 监听入口</h3>
+<pre><code>// 生成自签名证书（开发用）
+var cert = GenerateSelfSignedCertificate("localhost");
+
+// 配置 QUIC 监听
+var quicOpts = new QuicListenerOptions
+{
+    ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 8443),
+    ApplicationProtocols = new() { new SslApplicationProtocol("h3") },  // ALPN 标识
+    ConnectionOptionsCallback = (_, _, _) =>
+    {
+        return new ValueTask&lt;QuicServerConnectionOptions&gt;(new()
+        {
+            DefaultCloseErrorCode = 0x0,
+            DefaultStreamErrorCode = 0x0,
+            ServerAuthenticationOptions = new SslServerAuthenticationOptions
+            {
+                ServerCertificate = cert,
+            },
+        });
+    },
+};
+
+// 启动 UDP 监听
+await using var listener = await QuicListener.ListenAsync(quicOpts, ct);
+
+// Accept 循环 — 每个 QuicConnection 交给 H3Connection 处理
+while (!ct.IsCancellationRequested)
+{
+    var quicConn = await listener.AcceptConnectionAsync(ct);
+    _ = new H3Connection(quicConn, app).StartAsync(ct);
+}
+</code></pre>
+
+  <h3>H3Connection 请求处理主循环</h3>
+<pre><code>// 和 HTTP/2 完全不同 —— 不需要连接前言，不需要 SETTINGS 协商
+// 因为 QUIC + TLS 1.3 握手已经完成了协议协商
+public async Task StartAsync(CancellationToken ct)
+{
+    while (true)
+    {
+        // 等待客户端发一个新的 QUIC Stream
+        // 在 HTTP/3 里，每个"请求"就是一个 Stream
+        var stream = await _quic.AcceptInboundStreamAsync(ct);
+        _ = RunRequestAsync(stream, ct);
+    }
+}
+
+private async Task RunRequestAsync(QuicStream stream, CancellationToken ct)
+{
+    await using (stream)
+    {
+        // 读 HEADERS 帧（包含伪头部 :method :path）
+        var headers = await ReadHeadersAsync(stream, ct);
+
+        // 从 :method / :path 取出 Method / Path
+        // 构建 FeatureCollection → Pipeline
+        var features = new FeatureCollection();
+        features.Set&lt;IHttpRequestFeature&gt;(new HttpRequestFeature(
+            new HttpRequest { Method = method, Path = path, ... }));
+        features.Set&lt;IHttpResponseFeature&gt;(new HttpResponseFeature());
+        await _app.ProcessRequestAsync(features, ct);
+
+        // 发回 HEADERS 帧（带 :status 伪头部）+ DATA 帧
+        await SendHeadersAsync(stream, resp, ct);
+        await SendBodyAsync(stream, resp.Body, ct);
+
+        // 告诉对端：我发完了
+        stream.CompleteWrites();  // ← QuicStream 专属
+    }
+}
+</code></pre>
+
+  <!-- ======= HTTP/3 Kestrel 源码 ======= -->
+  <h2>Kestrel 的 HTTP/3 源码地图</h2>
+
+  <table>
+    <tr><th>文件</th><th>职责</th></tr>
+    <tr><td><code>Http3Connection.cs</code> (~800 行)</td><td>HTTP/3 连接总控 — 启动控制流、接收 SETTINGS、接受请求 Stream</td></tr>
+    <tr><td><code>Http3RequestStream.cs</code> (~400 行)</td><td>单个 QUIC 请求 Stream — 读 HEADERS/DATA、写 HEADERS/DATA、QPACK 解码</td></tr>
+    <tr><td><code>Http3FrameReader.cs</code> / <code>Http3FrameWriter.cs</code></td><td>HTTP/3 帧编解码（varint + 帧类型 + 载荷）</td></tr>
+    <tr><td><code>Http3SettingsFrame.cs</code></td><td>SETTINGS 帧结构</td></tr>
+    <tr><td><code>Transport/QuicTransportConnection.cs</code></td><td>把 QuicConnection 包装成 TransportConnection 抽象</td></tr>
+    <tr><td><code>System.Net.Quic</code> (.NET BCL)</td><td>QUIC 底层 — QuicListener、QuicConnection、QuicStream</td></tr>
+  </table>
+
+  <p>对比我们的简化版，Kestrel 还做了：</p>
+  <ul>
+    <li>✅ <strong>控制流启动</strong> — 连接建立后主动开一个 Control Stream，协商 SETTINGS</li>
+    <li>✅ <strong>完整 QPACK</strong> — 比 HPACK 多了 Encoder/Decoder 两个单向 Stream 同步动态表</li>
+    <li>✅ <strong>PUSH_PROMISE 帧</strong> — HTTP/3 还保留了服务器推送但很少用</li>
+    <li>✅ <strong>WebTransport</strong> — HTTP/3 的应用级协议扩展（WebTransport 是 HTTP/3 的"WebSocket 2.0"）</li>
+    <li>✅ <strong>CONNECT 方法</strong> — HTTP/3 可以把一个 QUIC Stream 隧道成任意协议</li>
+  </ul>
+
+  <!-- ======= 实战：发送 HTTP/2 和 HTTP/3 请求 ======= -->
+  <h2>实战：发送 HTTP/2 和 HTTP/3 请求</h2>
+
+  <p>服务器已经跑起来了（<code>dotnet run --project MinimalHttpServer</code>），现在客户端怎么发 HTTP/2 和 HTTP/3 请求？</p>
+
+  <h3>方式 1：curl 命令行</h3>
+<pre><code># HTTP/1.1（默认）
+curl http://localhost:8080/hello
+
+# HTTP/2 明文（h2c = HTTP/2 cleartext，不走 TLS）
+# --http2-prior-knowledge 跳过 Upgrade 直接发 HTTP/2 前言
+curl --http2-prior-knowledge http://localhost:8080/hello
+
+# HTTP/3（需要 curl 编译时带 HTTP/3 支持，且信任我们的自签名证书）
+# 注意：Windows 上默认 curl 不带 HTTP/3，可能需要用 --http3-only
+curl --http3-only -k https://localhost:8443/hello
+# 提示：-k = 跳过证书验证（开发用）
+</code></pre>
+
+  <h3>方式 2：.NET HttpClient（HTTP/2）</h3>
+  <p>HttpClient 在 .NET 里对 HTTP/2 的支持基于 SslStream（TLS 上 ALPN 协商 h2），或者我们用 h2c 直接指定：</p>
+
+<pre><code>// Program.cs 或任意控制台 app
+using System.Net.Http;
+
+// 方式 A：HTTP/2 over h2c（明文，用 URI scheme h2c://）
+// 注意：.NET HttpClient 的 h2c 支持是从 .NET 6 开始有的
+using var httpClient = new HttpClient();
+var request = new HttpRequestMessage(HttpMethod.Get, "h2c://localhost:8080/hello");
+request.Version = HttpVersion.Version20;  // 强制 HTTP/2
+var response = await httpClient.SendAsync(request);
+Console.WriteLine($"Status: {response.StatusCode}");
+Console.WriteLine(await response.Content.ReadAsStringAsync());
+
+// 方式 B：带 --http2-prior-knowledge 的 .NET 示例代码
+// （我们的服务器不强制 Upgrade，客户端必须先发 24 字节前言）
+// HttpClient 内部的 h2c 实现就是先发 ConnectionPreface 再发 SETTINGS
+</code></pre>
+
+  <h3>方式 3：.NET HttpClient（HTTP/3）</h3>
+  <p>HTTP/3 在 .NET 里也需要 HttpClient —— 但需要一个支持 QUIC 的 Handler 配置：</p>
+
+<pre><code>using System.Net.Http;
+using System.Net.Http.Headers;
+
+// HTTP/3 请求 —— 指定 HttpVersionPolicy 和 HTTP/3
+var handler = new HttpClientHandler
+{
+    // HTTP/3 强制要求 TLS 1.3 + 证书信任
+    // 开发时可以自定义 ServerCertificateCustomValidationCallback 跳过验证
+    ServerCertificateCustomValidationCallback = (_, cert, chain, errors) => true,
+};
+
+using var client = new HttpClient(handler);
+client.DefaultRequestVersion = HttpVersion.Version30;
+client.DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrHigher;
+
+var response = await client.GetAsync("https://localhost:8443/hello");
+Console.WriteLine($"HTTP版本: {response.Version}");  // 应该显示 HTTP/3
+Console.WriteLine($"内容: {await response.Content.ReadAsStringAsync()}");
+
+// 如果 HttpVersion.Version30 不存在或 HttpClient 不支持 HTTP/3
+// 可以试试：
+// request.Version = new Version(3, 0);
+// request.VersionPolicy = HttpVersionPolicy.RequestVersionExact;
+</code></pre>
+
+  <div class="warning">
+    <p><strong>⚠️ 关于 HTTP/3 客户端的注意事项</strong></p>
+    <ul>
+      <li>HTTP/3 必须走 TLS 1.3 — QUIC 内建 TLS，不像 TCP 可以明文跑 h2c</li>
+      <li>HttpClient 的 HTTP/3 支持在 .NET 7+ 才逐步完善，不同版本行为可能不同</li>
+      <li>自签名证书需要 ServerCertificateCustomValidationCallback 跳过验证</li>
+      <li>Windows 的 Schannel 对 QUIC 支持有一些平台限制</li>
+    </ul>
+  </div>
+
+  <!-- ======= 三种协议的统一抽象 ======= -->
+  <h2>三种协议统一抽象 —— 为什么 Kestrel 设计成 Connection 可插拔？</h2>
+
+  <p>到这里你应该能看到我们整个 MinimalHttpServer 设计的精妙之处了：</p>
+
+  <div class="diagram">
+<pre>
+                    ┌─────────────────────┐
+                    │  Application Pipeline │
+                    │  (SimpleMiddleware)  │
+                    └─────────▲───────────┘
+                              │
+                    ProcessRequestAsync(features)
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        │                     │                     │
+┌───────┴───────┐    ┌────────┴────────┐    ┌────────┴────────┐
+│ HttpConnection│    │  H2Connection   │    │  H3Connection   │
+│  (HTTP/1.1)   │    │    (HTTP/2)     │    │    (HTTP/3)     │
+└───────▲───────┘    └────────▲────────┘    └────────▲────────┘
+        │                     │                     │
+┌───────┴───────┐    ┌────────┴────────┐    ┌────────┴────────┐
+│  SocketTransport│   │  SocketTransport│   │  QuicConnection │
+│    (TCP)      │    │    (TCP)        │    │    (QUIC/UDP)   │
+└───────────────┘    └─────────────────┘    └─────────────────┘
+</pre>
+  </div>
+
+  <p>Transport 层和 Connection 层解耦 → Protocol 层和 Pipeline 层解耦 → 三种协议共享同一套 Pipeline。这就是 Kestrel 的核心设计思想 —— <strong>上层不关心底层跑的是 HTTP/1.1 还是 HTTP/2 还是 HTTP/3</strong>。</p>
+
+  <p>当客户端连上来时，Kestrel 也像我们在 <code>Program.cs</code> 里做的那样：</p>
+  <ol>
+    <li>从 Socket 读前几个字节 / 从 TLS ALPN 协商结果</li>
+    <li>判断对方要哪个协议</li>
+    <li>构造对应的 Connection 对象</li>
+    <li>交给统一的 Pipeline 处理</li>
+  </ol>
+
+  <!-- ======= 总结 ======= -->
+  <h2>总结</h2>
+
+  <div class="summary">
+    <p>这节课我们实现了 HTTP/2 和 HTTP/3 的简化版 Connection 层：</p>
+    <ul>
+      <li><strong>HTTP/2</strong> — 24 字节连接前言识别 + SETTINGS 协商 + 9 字节固定帧头 + 多路 Stream + HPACK 简化版 → 一个 TCP 连接上 N 个并发请求</li>
+      <li><strong>HTTP/3</strong> — QuicListener UDP 监听 + ALPN "h3" + QUIC varint 帧头 + 每个请求独立 QUIC Stream → 解决 TCP 层队头阻塞</li>
+    </ul>
+
+    <p>和 Kestrel 源码对比，我们简化掉了：</p>
+    <ul>
+      <li>HTTP/2：完整 HPACK（Huffman + 动态表）、流量控制窗口、Continuation 帧</li>
+      <li>HTTP/3：控制流 SETTINGS 协商、QPACK 动态表同步流、WebTransport、Server Push</li>
+      <li>两者都用 Pipe 替代 Stream、SocketAwaitable 零分配 awaitable</li>
+    </ul>
+
+    <p>但核心的架构思想和代码流程是一致的 —— 读传输层数据 → 解析帧 → 分发给 Stream → 填 Features → 调 Pipeline → 写响应帧。</p>
+  </div>
+
+  <!-- ======= 下一步 ======= -->
+  <h2>下一步可以做什么？</h2>
+
+  <ol>
+    <li><strong>把我们的 HPACK 升级成真正的 Kestrel 版本</strong> — 静态表 + Huffman + 动态表，头部压缩效率翻 5 倍</li>
+    <li><strong>加入流量控制</strong> — WINDOW_UPDATE 帧 + 窗口管理，防止慢客户端拖垮服务器</li>
+    <li><strong>Pipe 重构</strong> — 把 SocketTransport.ReadAsync/WriteAsync 换成 PipeReader/PipeWriter，零拷贝</li>
+    <li><strong>把 HTTP/2 和 HTTP/3 的 ALPN 检测做成统一的 ListenOptions</strong> — Kestrel 的 ListenOptions 就是这么设计的</li>
+    <li><strong>压测对比 HTTP/1.1 vs HTTP/2 vs HTTP/3</strong> — 看多路复用和 QUIC 的实际收益</li>
+  </ol>
+
+</div>
+</body>
+</html>

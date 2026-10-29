@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="MinimalHttpClient/MinimalHttpClient.csproj" />
+  <Project Path="MinimalHttpServer/MinimalHttpServer.csproj" />
+</Solution>

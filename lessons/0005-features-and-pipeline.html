@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 05 课 · Features 字典与 Pipeline</title>
+  <link rel="stylesheet" href="../assets/styles.css">
+</head>
+<body>
+<div class="container">
+
+  <div class="breadcrumb">
+    <a href="../MISSION.md">Mission</a> → Kestrel 源码学习 → 第 05 课
+  </div>
+
+  <h1>第 05 课 · Features 字典 —— Pipeline 怎么拿到请求/响应？</h1>
+
+  <div class="meta">
+    <span>预计阅读 15 分钟</span>
+    <span>四层架构最后一块拼图</span>
+    <span>业务逻辑从 Connection 里剥离</span>
+  </div>
+
+  <!-- 问题引入 -->
+  <h2>现在我们的 Connection 有什么越界？</h2>
+
+  <p>打开 <code>HttpConnection.cs</code> 看 <code>HandleRequest</code> 方法 — 它做了什么？</p>
+
+  <ol>
+    <li>检查 Method 是不是 GET（HTTP 协议层面的事，Protocol Layer 该做的）</li>
+    <li>根据 Path 返回不同内容（<strong>这就是业务逻辑，应该在 Application Pipeline</strong>）</li>
+    <li>设置 StatusCode / SetText（HTTP 响应格式，Protocol Layer 的事）</li>
+  </ol>
+
+  <blockquote>
+    <strong>越界了！</strong>一个 Connection 不应该知道"访问 /hello 返回什么"、"访问 /time 返回什么"。它应该只做三件事：<strong>读字节 → 解析成 HTTP 语义 → 把语义塞进一个统一的数据包 → 交给上层</strong>。至于上层怎么路由、怎么生成响应，跟 Connection 无关。
+  </blockquote>
+
+  <p>Kestrel 用什么当这个"统一的数据包"？—— <strong>Feature 接口集合</strong>。</p>
+
+  <!-- Feature 是什么 -->
+  <h2>Feature 接口集合是什么？</h2>
+
+  <p>Kestrel 不为 Pipeline 定义一个巨大的 <code>IHttpContext</code> 接口，而是拆成了一组单一职责的小接口：</p>
+
+  <table>
+    <tr><th>Feature 接口</th><th>职责</th><th>谁填的</th></tr>
+    <tr><td><code>IHttpRequestFeature</code></td><td>Method, Path, Headers, Body</td><td>Protocol Layer（Http1Connection 等）</td></tr>
+    <tr><td><code>IHttpResponseFeature</code></td><td>StatusCode, Headers, Body, HasStarted</td><td>Protocol Layer 初始化，Pipeline 填写</td></tr>
+    <tr><td><code>IHttpConnectionFeature</code></td><td>RemoteAddress, LocalAddress</td><td>Protocol Layer（从 Transport 拿）</td></tr>
+    <tr><td><code>ITlsConnectionFeature</code></td><td>ClientCertificate</td><td>Protocol Layer（TLS 握手后）</td></tr>
+    <tr><td><code>IHttpRequestIdentifierFeature</code></td><td>TraceIdentifier（请求唯一 ID）</td><td>谁都行，Pipeline 也能加</td></tr>
+    <tr><td>……</td><td>……</td><td>……</td></tr>
+  </table>
+
+  <p>然后这些 Feature 被塞进一个 <code>IFeatureCollection</code>（本质就是个 <code>Dictionary&lt;Type, object&gt;</code>）。Pipeline 通过这个字典拿它需要的接口：</p>
+
+<pre><code>// Kestrel Pipeline 里的典型用法
+var requestFeature = context.Features.Get&lt;IHttpRequestFeature&gt;();
+var responseFeature = context.Features.Get&lt;IHttpResponseFeature&gt;();
+
+if (requestFeature.Path == "/hello") {
+    responseFeature.StatusCode = 200;
+    await responseFeature.Body.WriteAsync(Encoding.UTF8.GetBytes("Hello!"));
+}</code></pre>
+
+  <!-- 为什么用接口字典而不是 HttpContext -->
+  <h2>为什么用接口字典？而不是一个大 HttpContext？</h2>
+
+  <p>你可能会问：为什么不直接传一个 HttpContext 类，里面啥都有？三个原因：</p>
+
+  <h3>① 协议层透明</h3>
+  <p>Pipeline 里写的 <code>context.Features.Get&lt;IHttpRequestFeature&gt;()</code>，底层可能是 Http1Connection 填的，也可能是 Http2Connection 填的，也可能是 Http3Connection 填的 —— Pipeline 不在乎。接口隔离了协议差异。</p>
+
+  <h3>② 可选功能按需加载</h3>
+  <p>如果一个 Feature 不存在（比如 HTTP/1.1 连接没有 TLS，就不会有 <code>ITlsConnectionFeature</code>），<code>Get&lt;T&gt;()</code> 返回 null。Pipeline 可以优雅降级，而 HttpContext 大对象不管用不用都得 new 出来。</p>
+
+  <h3>③ 第三方扩展零侵入</h3>
+  <p>任何中间件都可以加自定义 Feature —— 比如你想加一个 <code>ISqlConnectionFeature</code> 让下游中间件共享一个数据库连接池的连接，只需要在 Pipeline 前面的中间件里 <code>context.Features.Set&lt;ISqlConnectionFeature&gt;(conn)</code>，下游就能 <code>Get</code> 到。HttpContext 大对象做不到这一点。</p>
+
+  <!-- Pipeline 是什么 -->
+  <h2>Pipeline 是什么？</h2>
+
+  <p>Pipeline 就是一组 <strong>Application 中间件</strong>。在我们的简化版里，就是这么一个接口：</p>
+
+<pre><code>// 简化版 Pipeline 接口
+// Kestrel 里对应的是 IHttpApplication + RequestDelegate 链
+
+public interface IHttpApplication
+{
+    Task ProcessRequestAsync(IFeatureCollection features);
+}</code></pre>
+
+  <p>Connection 不路由、不生成响应，它只做：</p>
+
+<pre><code>// Connection.StartAsync 现在的伪代码
+public async Task StartAsync(CancellationToken ct) {
+    while (true) {
+        var request = await ReadAndParseAsync(ct);
+
+        // ① 填 Features（Protocol Layer 的事）
+        var features = new FeatureCollection();
+        features.Set&lt;IHttpRequestFeature&gt;(new HttpRequestFeature(request));
+        features.Set&lt;IHttpResponseFeature&gt;(new HttpResponseFeature());
+        features.Set&lt;IHttpConnectionFeature&gt;(new HttpConnectionFeature(_transport));
+
+        // ② 交给 Pipeline（Application Layer 的事）
+        await _application.ProcessRequestAsync(features);
+
+        // ③ 从 Features 里取 Pipeline 填好的响应，序列化写回
+        var response = features.Get&lt;IHttpResponseFeature&gt;();
+        await WriteResponseAsync(response, ct);
+
+        // ④ 判断 Keep-Alive ...
+    }
+}</code></pre>
+
+  <!-- 四层架构全貌 -->
+  <h2>现在四层架构全貌</h2>
+
+  <div class="arch-diagram">
+<span class="layer" style="background:#0969da;">① KestrelServer — Accept 循环（Program.cs）</span>
+<div class="arrow">↓ new SocketTransport(socket)</div>
+<span class="layer" style="background:#1a7f37;">② Transport — SocketTransport 提供 Read/Write 字节通道</span>
+<div class="arrow">↓ 构造函数注入 ITransportConnection</div>
+<span class="layer" style="background:#bf8700;">③ Protocol — HttpConnection 读/解析/填 Features</span>
+<div class="arrow">↓ IFeatureCollection（接口字典，这就是层间契约！）</div>
+<span class="layer" style="background:#8250df;">④ Application — Pipeline 路由 + 生成响应</span>
+  </div>
+
+  <p>注意 <strong>IFeatureCollection</strong> 是第 ③ 和第 ④ 层之间的 <strong>唯一</strong> 交互方式。Protocol 层不知道 Pipeline 是什么，Pipeline 层不知道 Connection 是什么 —— 两边只通过 Feature 接口字典"说话"。</p>
+
+  <!-- Kestrel 源码锚点 -->
+  <h2>Kestrel 源码里的对应</h2>
+
+  <ul>
+    <li>👉 <code>src/Features/IHttpRequestFeature.cs</code> — Kestrel 的请求特性接口。只有 get/set 属性，没有方法</li>
+    <li>👉 <code>src/Features/IFeatureCollection.cs</code> — 接口字典，核心是 <code>T Get&lt;T&gt;()</code> / <code>void Set&lt;T&gt;(T feature)</code></li>
+    <li>👉 <code>src/Features/FeatureReferences&lt;TContext&gt;.cs</code> — Kestrel 2.0+ 的 Feature 引用缓存。每次 Get 要查字典太慢，Kestrel 在 Connection 对象上缓存常用 Feature 的引用，避免重复查表。这是个重要的性能优化点</li>
+    <li>👉 <code>Http1Connection.ProcessRequestAsync()</code> — 看它怎么把 HttpRequest 和 HttpResponse 填进 Feature，然后调 <code>_httpApplication.ProcessRequestAsync(context)</code>。这就是我们要做的事</li>
+  </ul>
+
+  <!-- 动手任务 -->
+  <h2>🎯 动手改造清单</h2>
+
+  <ol>
+    <li>新建 <code>Features</code> 目录和接口文件：<code>IHttpRequestFeature</code>、<code>IHttpResponseFeature</code>、<code>IHttpConnectionFeature</code></li>
+    <li>新建 <code>FeatureCollection.cs</code> — <code>Dictionary&lt;Type, object&gt;</code> 包装</li>
+    <li>新建 <code>IHttpApplication.cs</code> + <code>SimpleMiddleware.cs</code> — Pipeline 接口和实现</li>
+    <li>重构 <code>HttpConnection.cs</code>：构造函数多接收一个 <code>IHttpApplication</code>，<strong>删除 HandleRequest 方法</strong>，改成填 Features → 调 Application → 写响应</li>
+    <li>改 <code>Program.cs</code>：配置路由成 SimpleMiddleware，传给 HttpConnection</li>
+  </ol>
+
+  <h3>重构自检</h3>
+  <ul>
+    <li>✅ HttpConnection.cs 里不再出现路由逻辑（switch on Path → response text）</li>
+    <li>✅ HttpConnection.cs 里不再创建 HttpResponse 并 SetText</li>
+    <li>✅ SimpleMiddleware.cs 里能看到所有路由逻辑</li>
+    <li>✅ HttpConnection 和 SimpleMiddleware 互相不知道对方的具体类型</li>
+  </ul>
+
+  <!-- 下一课预告 -->
+  <div class="lesson-nav">
+    <a href="0004-transport-abstraction.html">← 第 04 课：Transport 抽象层</a>
+    <span style="color:var(--text-muted); font-size:0.9rem; align-self:center;">
+      改完跑起来，看看 HttpConnection.cs 是不是变瘦了很多。<br>Connection 只管读和写，业务逻辑全在 Pipeline — 这就是职责分离。
+    </span>
+    <span class="disabled">第 06 课：性能对比 →</span>
+  </div>
+
+</div>
+</body>
+</html>

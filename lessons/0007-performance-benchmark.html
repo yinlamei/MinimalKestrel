@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 06 课 · 性能对比 — 我们的 vs Kestrel</title>
+  <link rel="stylesheet" href="../assets/styles.css">
+</head>
+<body>
+<div class="container">
+
+  <div class="breadcrumb">
+    <a href="../MISSION.md">Mission</a> → Kestrel 源码学习 → 第 06 课
+  </div>
+
+  <h1>第 06 课 · 性能对比 —— 我们的 vs Kestrel</h1>
+
+  <div class="meta">
+    <span>预计阅读 15 分钟</span>
+    <span>实测 + 分析</span>
+    <span>所有课程的最终验证</span>
+  </div>
+
+  <!-- 为什么要做 Benchmark -->
+  <h2>为什么要测性能？</h2>
+
+  <p>到 v0.5 为止，我们的 MinimalHttpServer 架构上已经和 Kestrel 四层对齐了：</p>
+  <ul>
+    <li>✅ Transport 抽象层 — 有</li>
+    <li>✅ Connection 对象化 + Keep-Alive — 有</li>
+    <li>✅ HttpParser 状态解析 — 有（虽然简陋）</li>
+    <li>✅ Feature 字典 + Pipeline — 有</li>
+  </ul>
+
+  <p>但架构对齐 ≠ 性能对齐。Kestrel 每秒能处理几十万请求，我们这个估计几千就到头了。差距在哪？这节课通过实测来回答。</p>
+
+  <!-- 测试方法 -->
+  <h2>测试方法</h2>
+
+  <p>我们测三个服务器，同一个简单 GET 请求 <code>/hello</code>（返回固定文本），保持 Keep-Alive，测 QPS：</p>
+
+  <table>
+    <tr><th>服务器</th><th>说明</th></tr>
+    <tr><td><strong>MinimalHttpServer</strong></td><td>我们的 v0.5 实现 — Socket + 朴素 ReadAsync + 朴素 Parser</td></tr>
+    <tr><td><strong>HttpListener</strong></td><td>.NET 内置的 HTTP 监听器（System.Net.HttpListener）— 传统做法</td></tr>
+    <tr><td><strong>Kestrel</strong></td><td>ASP.NET Core 默认 Web 服务器 — 业界最佳实践</td></tr>
+  </table>
+
+  <p>用 BenchmarkDotNet 写一个统一的客户端压测，三个服务器分别跑。测两个维度：</p>
+  <ol>
+    <li><strong>单次请求延迟</strong>（ns）— 最小开销</li>
+    <li><strong>并发 QPS</strong> — 吞吐量</li>
+  </ol>
+
+  <!-- 预期差距分析 -->
+  <h2>先猜一猜：差距可能在哪？</h2>
+
+  <p>在跑 Benchmark 之前，我们先做一轮"性能头脑风暴" — 想想 Kestrel 可能在哪些地方比我们快：</p>
+
+  <h3>① 内存分配</h3>
+  <p>我们的 <code>ReadFullRequestAsync</code> 每次都 <code>new byte[8192]</code>，<code>HttpParser.Parse</code> 每次都 <code>Split("\r\n")</code>，<code>FeatureCollection</code> 每次 new。一次请求下来可能分配几十 KB 临时对象。</p>
+
+  <p>Kestrel 怎么做的？</p>
+  <ul>
+    <li>用 <strong>MemoryPool&lt;byte&gt;</strong> 从池中租借内存，用完归还，零分配</li>
+    <li>用 <strong>Pipe</strong> 替代 Stream，PipeReader/PipeWriter 共享内存段，零拷贝</li>
+    <li><strong>HttpParser 状态机</strong>逐字节解析，直接在 Pipe 的内存段上原地操作，不 Split 不 new</li>
+    <li><strong>FeatureReferences&lt;TContext&gt;</strong> 缓存 Feature 接口引用，避免每次 Get 查字典</li>
+  </ul>
+
+  <h3>② Socket 开销</h3>
+  <p>我们每次 Read 都是 <code>await _socket.ReceiveAsync(buffer, ct)</code> — 每个请求 await 至少 2-3 次（读头部 + 可能读 Body）。每次 await 都会让 IOCP 线程池调度一次。</p>
+
+  <p>Kestrel 怎么做的？</p>
+  <ul>
+    <li><strong>SocketAwaitable</strong> — 自定义 awaitable，不分配 Task 对象，避免每次 await 的堆分配</li>
+    <li>Transport 层后台跑 <strong>持续搬运循环</strong>：一个循环从 Socket 读 → PipeWriter.Write → PipeWriter.FlushAsync；另一个循环 PipeReader.ReadAsync → Socket.SendAsync。Connection 层只和 Pipe 交互，不碰 Socket</li>
+    <li><strong>PipeReader.ReadAsync(Min, Max)</strong> — 支持"至少给我 Min 字节"的语义，避免每次只 Read 一点就触发解析</li>
+  </ul>
+
+  <h3>③ 解析器开销</h3>
+  <p>我们用 <code>Encoding.UTF8.GetString → Split("\r\n") → Split(':')</code> — 多次字符串分配 + 多次遍历。Kestrel 用 <code>HttpParser</code> 状态机直接在 byte span 上解析，零字符串分配直到真正需要 ToString 时。</p>
+
+  <h3>④ 背压与流控制</h3>
+  <p>我们没做背压 — Pipeline 写响应比 Socket 发得快时，数据会堆在内核缓冲区。Pipe 有内置背压：PipeWriter.Write 超过阈值时会阻塞，自然让 Pipeline 等 Socket 追上来。</p>
+
+  <h3>⑤ 连接池与复用</h3>
+  <p>我们每次 Accept → new SocketTransport → new HttpConnection → new FeatureCollection → new HttpRequest → new HttpResponse → new HttpRequestFeature → new HttpResponseFeature。十几个对象。</p>
+
+  <p>Kestrel 对很多对象做了 <strong>池化</strong>：ConnectionContext、Http1Connection 甚至 FeatureCollection。连接断开后对象不是直接 GC，而是归还对象池，下次 Accept 取出来复用。</p>
+
+  <!-- 跑 Benchmark -->
+  <h2>🎯 动手：跑 Benchmark</h2>
+
+  <p>我已经准备好了一个 Benchmark 项目，包含三个服务器实现和一个压测客户端。先跑起来看数据，再对照上面的猜测。</p>
+
+  <div class="exercise">
+    运行 Benchmark：<br>
+    <code>dotnet run --project ./benchmark/HttpPerfBenchmark -c Release</code><br>
+    观察输出的 QPS、单次请求耗时、以及 Allocations 列 —— 差距会很明显。
+  </div>
+
+  <!-- Kestrel 源码锚点 -->
+  <h2>Kestrel 源码里的性能关键点</h2>
+
+  <p>对照 Benchmark 结果，去 Kestrel 源码里找对应的优化：</p>
+
+  <ul>
+    <li>👉 <code>SocketSender.ReceiveAsync</code> / <code>SocketSender.SendAsync</code> — 自定义 SocketAwaitable，零 Task 分配</li>
+    <li>👉 <code>HttpParser.ParseRequestLine</code> — 状态机逐字节解析 Span&lt;byte&gt;，零分配</li>
+    <li>👉 <code>FeatureReferences&lt;TContext&gt;</code> — 在 Connection 对象上缓存常用 Feature 引用，结构体重叠排列</li>
+    <li>👉 <code>MemoryPool&lt;byte&gt;.</code> — Kestrel 默认用 SlabMemoryPool，按 slab 块出租，减少 GC 压力</li>
+    <li>👉 Transport 层的 <code>PipeReader/CopyToAsync</code> 和 <code>PipeWriter.CopyToAsync</code> — 后台搬运循环</li>
+  </ul>
+
+  <!-- 下一课预告 -->
+  <div class="lesson-nav">
+    <a href="0005-features-and-pipeline.html">← 第 05 课：Features + Pipeline</a>
+    <span style="color:var(--text-muted); font-size:0.9rem; align-self:center;">
+      跑起来看数据，再对照差距分析。<br>Benchmark 的 Allocations 列最能说明问题。
+    </span>
+    <span class="disabled">课程系列完结 →</span>
+  </div>
+
+</div>
+</body>
+</html>

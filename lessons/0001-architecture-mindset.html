@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>第 01 课 · Kestrel 架构心智模型</title>
+  <link rel="stylesheet" href="../assets/styles.css">
+</head>
+<body>
+<div class="container">
+
+  <div class="breadcrumb">
+    <a href="../MISSION.md">Mission</a> → Kestrel 源码学习 → 第 01 课
+  </div>
+
+  <h1>第 01 课 · Kestrel 架构心智模型</h1>
+
+  <div class="meta">
+    <span>预计阅读 15 分钟</span>
+    <span>源码阅读入门</span>
+    <span>先建立地图，再读代码</span>
+  </div>
+
+  <!-- 开篇：你以为你知道怎么写 Web 服务器 -->
+  <h2>先写个"你以为的"服务器</h2>
+
+  <p>有 15 年 C# 经验，让你写一个最简 HTTP 服务器，大概 30 行代码就能搞定：</p>
+
+<pre><code>using var listener = new Socket(AddressFamily.InterNetwork,
+    SocketType.Stream, ProtocolType.Tcp);
+listener.Bind(new IPEndPoint(IPAddress.Loopback, 8080));
+listener.Listen(100);
+
+while (true) {
+    var client = await listener.AcceptAsync();
+    _ = HandleRequestAsync(client);  // fire-and-forget
+}
+
+async Task HandleRequestAsync(Socket client) {
+    using (client) {
+        var buf = new byte[4096];
+        var n = await client.ReceiveAsync(buf);
+        var request = Encoding.UTF8.GetString(buf, 0, n);
+        // 简单解析：第一行 Method + Path
+        var path = request.Split(' ')[1];
+        var body = $"Hello {path}".ToBytes();
+        var resp = $"HTTP/1.1 200 OK\r\nContent-Length: {body.Length}\r\n\r\n".ToBytes();
+        await client.SendAsync(resp);
+        await client.SendAsync(body);
+    }
+}</code></pre>
+
+  <p>这能跑。curl 一下有响应。但——这不是 Kestrel 的风格，差距在于：</p>
+
+  <div class="tip">
+    Kestrel 的核心设计哲学是<strong>"为每个变化维度建一层抽象"</strong>。上面 30 行代码把监听、连接、解析、应用逻辑全耦合在一起了；Kestrel 把它们拆成了四层，每层独立演化。
+  </div>
+
+  <!-- 四层架构图 -->
+  <h2>Kestrel 四层架构</h2>
+
+  <div class="arch-diagram">
+<span class="layer" style="background:#0969da;">① KestrelServer （入口：启动监听循环）</span>
+<div class="arrow">↓ Accept / AcceptAsync</div>
+<span class="layer" style="background:#1a7f37;">② Transport + ConnectionFactory （传输层 + 连接管理）</span>
+<div class="arrow">↓ 创建 ConnectionContext</div>
+<span class="layer" style="background:#bf8700;">③ Protocol Layer （协议解析：Http1 / Http2 / Quic）</span>
+<div class="arrow">↓ 将 Socket 字节流解析为 IHttpRequest / IHttpResponse 特性</div>
+<span class="layer" style="background:#8250df;">④ Application Pipeline （中间件管道：Minimal API / MVC / WebSocket）</span>
+  </div>
+
+  <p>这四层之间<strong>只有向上依赖</strong>，不反向耦合。下面逐层拆给你看。</p>
+
+  <!-- 逐层拆解 -->
+  <h3>① KestrelServer — 监听入口</h3>
+
+  <p>源码位置：<code>src/Servers/Kestrel/Core/KestrelServer.cs</code></p>
+
+  <p>这是整个服务器的起点。核心就是循环调用 <code>Transport.BindAsync()</code> 然后不断 Accept，把新连接交给 ConnectionFactory。它只做两件事：</p>
+
+  <ul>
+    <li>根据 <code>KestrelServerOptions</code> 配置端口、绑定地址、证书</li>
+    <li>启动 Accept 循环，把 Socket 交给 ConnectionFactory</li>
+  </ul>
+
+  <blockquote>
+    <strong>关键洞察：</strong>KestrelServer 本身<strong>不持有任何连接</strong>。它只管 Accept，Accept 之后的事全丢给 ConnectionFactory。这让它能同时监听多个端口（HTTPS + HTTP 同进程），也能在不停服的情况下重新加载配置。
+  </blockquote>
+
+  <h3>② Transport + ConnectionFactory — 传输抽象 + 连接管理</h3>
+
+  <p>这是 Kestrel 最聪明的一层。</p>
+
+  <p><strong>Transport</strong> 是底层传输方式的抽象。Kestrel 支持多种传输：</p>
+  <ul>
+    <li><code>SocketsTransport</code> — 现在默认的，纯托管 Socket</li>
+    <li><code>QuicTransport</code> — HTTP/3 的 QUIC 传输</li>
+    <li>历史上有 <code>LibuvTransport</code>（已弃用，Kestrel 1.x 时代用的 libuv）</li>
+  </ul>
+
+  <p><strong>ConnectionFactory</strong> 的职责是：每收到一个新 Socket，创建一个 <code>ConnectionContext</code>。<code>ConnectionContext</code> 是一次 TCP 连接的<strong>全部状态容器</strong>——它持有 Transport、协议处理器、以及在 Application Pipeline 中流转的所有 Feature。</p>
+
+<pre><code>// ConnectionFactory 的核心逻辑（简化）
+public ConnectionContext CreateConnection(TransportConnection transport) {
+    var context = new DefaultConnectionContext(transport);
+    // 配置协议层：Http1Connection 或 Http2Connection
+    context.ConfigureProtocol(this);
+    return context;
+}
+// 然后调用 ConnectionContext.StartAsync() 启动连接处理循环</code></pre>
+
+  <blockquote>
+    <strong>关键洞察：</strong>ConnectionContext 是整个设计的"胶水"。它是 Transport 层和 Protocol 层之间的桥梁，也是异步管道的起点。每个 TCP 连接对应一个 ConnectionContext，生命周期严格对齐。
+  </blockquote>
+
+  <h3>③ Protocol Layer — HTTP 协议解析</h3>
+
+  <p>源码位置：<code>src/Servers/Kestrel/Http/</code> 目录</p>
+
+  <p>Kestrel 支持三种协议，每种都有独立的实现：</p>
+
+  <table>
+    <tr><th>协议</th><th>实现类</th><th>解析方式</th></tr>
+    <tr><td>HTTP/1.1</td><td><code>Http1Connection</code></td><td>逐字节解析，状态机驱动</td></tr>
+    <tr><td>HTTP/2</td><td><code>Http2Connection</code></td><td>帧解析 + HPACK 头部压缩</td></tr>
+    <tr><td>HTTP/3 (Quic)</td><td><code>Http3Connection</code></td><td>QUIC 流 + HTTP/3 帧</td></tr>
+  </table>
+
+  <p>这一层的输入是 Socket 字节流，输出是一组标准化的 Feature：<code>IHttpRequestFeature</code>、<code>IHttpResponseFeature</code>、<code>IHttpConnectionFeature</code> 等。<strong>上层中间件不关心底下跑的是 HTTP/1.1 还是 HTTP/2</strong>。</p>
+
+  <h3>④ Application Pipeline — 中间件管道</h3>
+
+  <p>这一层你应该最熟悉。<code>ConnectionContext</code> 的协议层把 Feature 填好之后，调用 <code>IHttpApplication.ProcessRequestAsync(features)</code>。</p>
+
+  <p>这里的 <code>IHttpApplication</code> 就是你在 <code>Program.cs</code> 里 <code>app.UseRouting().UseEndpoints()</code> 堆出来的中间件管道。Kestrel 不知道 MVC、不知道 Minimal API，它只认这个接口。</p>
+
+  <!-- 对比表 -->
+  <h2>朴素 Socket vs Kestrel：到底差在哪？</h2>
+
+  <table>
+    <tr><th>维度</th><th>朴素 Socket 循环</th><th>Kestrel 设计</th></tr>
+    <tr><td>监听 & Accept</td><td>while + async void fire-and-forget</td><td>Accept 循环 + ConnectionFactory 统一管理</td></tr>
+    <tr><td>协议解析</td><td>Split(' ') 搞定</td><td>状态机驱动的 Http1Parser，逐字节零分配解析</td></tr>
+    <tr><td>传输切换</td><td>换 QUIC = 全重写</td><td>Transport 抽象，一行配置切换</td></tr>
+    <tr><td>连接管理</td><td>无（依赖 GC 收 Socket）</td><td>ConnectionContext + 后台 Ping 检测</td></tr>
+    <tr><td>内存分配</td><td>new byte[4096] per request</td><td>SocketAwaitable + 内存池复用</td></tr>
+    <tr><td>WebSocket</td><td>自己搞握手和帧</td><td>协议层直接支持 Feature</td></tr>
+    <tr><td>HTTP/2</td><td>不支持</td><td>同一套 Pipeline，协议层透明</td></tr>
+  </table>
+
+  <!-- 源码导航 -->
+  <h2>源码阅读导航图</h2>
+
+  <p>现在你知道该从哪开始读了。按这个顺序：</p>
+
+<pre><code>dotnet/aspnetcore/src/Servers/Kestrel/
+├── Core/
+│   ├── KestrelServer.cs           ← 从这里开始：启动循环入口
+│   ├── KestrelServerOptions.cs    ← 配置模型
+│   └── Internal/
+│       ├── KestrelServerImpl.cs   ← Accept 循环的实际实现
+│       └── TransportManager.cs    ← 管理一个或多个 Transport 监听
+│
+├── Transport/
+│   ├── Sockets/                   ← 当前默认传输
+│   │   └── SocketsTransport.cs
+│   └── Quic/                      ← HTTP/3 传输
+│
+├── Http/
+│   ├── Http1Connection.cs         ← HTTP/1.1 协议处理核心
+│   ├── Http2Connection.cs         ← HTTP/2
+│   ├── Http3Connection.cs         ← HTTP/3
+│   ├── Shared/HttpParser.cs       ← 通用解析器状态机
+│   └── Features/                  ← IHttpRequestFeature 等接口定义
+│
+└── Connection/
+    ├── ConnectionContext.cs       ← 连接上下文基类
+    └── ConnectionFactory.cs       ← 创建 ConnectionContext</code></pre>
+
+  <div class="tip">
+    <strong>阅读建议：</strong>先读 KestrelServerImpl.AcceptLoopAsync()，跟着一个新 Socket 一路追踪：谁创建 ConnectionContext、谁选协议、谁触发 Pipeline。这个调用链通了，你对 Kestrel 就有骨架了。
+  </div>
+
+  <!-- 动手练习 -->
+  <h2>🎯 动手练习</h2>
+
+  <p>现在轮到你。写一个最简 Socket HTTP 服务器，满足以下要求：</p>
+
+  <ul>
+    <li>监听 <code>http://localhost:8080</code></li>
+    <li>支持并发：每个新连接启动一个独立处理任务（不要阻塞 Accept）</li>
+    <li>解析 GET 请求，支持 3 个路由：<code>/</code>、<code>/hello</code>、<code>/time</code></li>
+    <li>返回正确的 <code>Content-Length</code> 头部和 <code>\r\n\r\n</code> 分隔符</li>
+    <li>处理好连接关闭（using Socket，或者 Timeout 自动关闭）</li>
+  </ul>
+
+  <p>写完之后对照你的实现和 Kestrel 的四层架构，思考：</p>
+
+  <ol>
+    <li>你的代码里，"Transport" 是哪个类？如果要把 Socket 换成 QUIC，要改哪些地方？</li>
+    <li>你的"Protocol Layer"在哪里？能拆出来吗？</li>
+    <li>如果要支持 HTTP/2，你的架构要做什么调整？</li>
+  </ol>
+
+  <div class="exercise">
+    创建一个 console 项目：<code>dotnet new console -n MinimalHttpServer</code>，把上面的代码骨架跑起来。
+  </div>
+
+  <!-- 延伸阅读 -->
+  <h2>延伸阅读</h2>
+
+  <ul>
+    <li>🎬 [Building a High Performance Web Server (David Fowler, Build 2018)](https://channel9.msdn.com/Events/Build/2018/THR3026) — Kestrel 核心作者讲设计演化，必看</li>
+    <li>📖 [ASP.NET Core Kestrel 源码系列 (博客园)](https://www.cnblogs.com/edisonchou/p/Kestrel_Source_Code_Reading_List.html) — 逐文件解读，适合第一次过源码时导航</li>
+    <li>📄 [Microsoft Docs: Kestrel 架构](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/servers/kestrel) — 官方 API 文档</li>
+  </ul>
+
+  <!-- 下一课预告 -->
+  <div class="lesson-nav">
+    <span class="disabled">← 上一课</span>
+    <span style="color:var(--text-muted); font-size:0.9rem; align-self:center;">
+      完成练习后，告诉我你的感受。<br>下一课我们会深入 ConnectionContext 的生命周期。
+    </span>
+    <a href="0002-connection-lifecycle.html">第 02 课：Connection 生命周期 →</a>
+  </div>
+
+</div>
+</body>
+</html>
